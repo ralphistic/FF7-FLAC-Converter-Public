@@ -1,0 +1,23 @@
+name: FF7FLACConverter
+options:
+  bundleIdPrefix: com.ralphistic
+targets:
+  FF7FLACConverter:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - FF7FLACConverter
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ralphistic.ff7flacconverter
+        SWIFT_VERSION: "5.0"
+        SWIFT_OBJC_BRIDGING_HEADER: FF7FLACConverter/FF7FLACConverter-Bridging-Header.h
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) EMU_COMPILE=1 EMU_LITTLE_ENDIAN=1"
+        OTHER_CFLAGS: "$(inherited) -fcommon"
+        OTHER_LDFLAGS: "$(inherited) -lz"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
+        INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
+        CODE_SIGNING_ALLOWED: "NO"

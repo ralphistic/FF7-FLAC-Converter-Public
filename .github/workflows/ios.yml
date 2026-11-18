@@ -1,0 +1,177 @@
+name: Build unsigned iOS shell
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Verify PSF metadata parsing
+        run: |
+          cat > /tmp/check-psf.swift <<'SWIFT'
+          import Foundation
+          var bytes = Data([0x50, 0x53, 0x46, 0x01] + Array(repeating: 0, count: 12))
+          bytes.append(Data("[TAG]\nlength=6:53\nfade=10\n_lib=Final Fantasy 7.psflib\n".utf8))
+          let metadata = try PSFMetadataReader.read(bytes)
+          precondition(metadata.totalSeconds == 423)
+          precondition(metadata.libraryNames == ["Final Fantasy 7.psflib"])
+          precondition(PSFMetadataReader.parseTime("2:30.5") == 150.5)
+          print("PSF metadata checks passed")
+          SWIFT
+          cat FF7FLACConverter/PSFMetadata.swift /tmp/check-psf.swift > /tmp/psf-check.swift
+          swift /tmp/psf-check.swift
+      - name: Verify recursive PSF library resolution
+        run: |
+          cat > /tmp/check-libs.swift <<'SWIFT'
+          import Foundation
+          let a = PSFTrackMetadata(title: nil, lengthSeconds: 10, fadeSeconds: 1, libraryNames: ["MAIN.PSFLIB"])
+          let b = PSFTrackMetadata(title: nil, lengthSeconds: nil, fadeSeconds: nil, libraryNames: ["nested.psflib"])
+          let c = PSFTrackMetadata(title: nil, lengthSeconds: nil, fadeSeconds: nil, libraryNames: ["main.psflib"])
+          let all = ["song.minipsf": a, "main.psflib": b, "nested.psflib": c]
+          precondition(PSFDependencies.missing(for: "song.minipsf", metadataByFilename: all).isEmpty)
+          precondition(PSFDependencies.missing(for: "song.minipsf", metadataByFilename: ["song.minipsf": a]) == ["MAIN.PSFLIB"])
+          print("Recursive dependencies, case folding, and cycle detection passed")
+          SWIFT
+          cat FF7FLACConverter/PSFMetadata.swift FF7FLACConverter/PSFDependencies.swift /tmp/check-libs.swift > /tmp/lib-check.swift
+          swift /tmp/lib-check.swift
+      - name: Verify native FLAC writer
+        run: |
+          brew install flac
+          cat > /tmp/check-flac.swift <<'SWIFT'
+          import Foundation
+          let url = URL(fileURLWithPath: "/tmp/ff7-flac-test.flac")
+          let writer = try FLACWriter(url: url)
+          let frames = 9000
+          var pcm: [Int16] = []
+          for i in 0..<frames {
+              let value = Int16((i % 1000) * 20 - 10000)
+              pcm.append(value)
+              pcm.append(-value)
+          }
+          try writer.append(interleavedPCM: Array(pcm.prefix(8192)))
+          try writer.append(interleavedPCM: Array(pcm.dropFirst(8192)))
+          try writer.finish()
+          precondition(writer.sampleFrames == UInt64(frames))
+          print("FLAC wrote \\(frames) stereo frames")
+          // Regression: full 7:03, including the declared fade, must never stop at 3:00.
+          let longWriter = try FLACWriter(url: URL(fileURLWithPath: "/tmp/ff7-full-length.flac"))
+          let totalFrames = 423 * 44100
+          let chunk = [Int16](repeating: 1234, count: 4096 * 2)
+          for _ in 0..<(totalFrames / 4096) {
+              try longWriter.append(interleavedPCM: chunk)
+          }
+          try longWriter.append(interleavedPCM: [Int16](repeating: 1234, count: (totalFrames % 4096) * 2))
+          try longWriter.finish()
+          precondition(longWriter.sampleFrames == UInt64(totalFrames))
+          print("Full-length 423-second FLAC written")
+          SWIFT
+          cat FF7FLACConverter/FLACWriter.swift /tmp/check-flac.swift > /tmp/flac-check.swift
+          swiftc -O /tmp/flac-check.swift -o /tmp/ff7-flac-check
+          /tmp/ff7-flac-check
+          flac -t /tmp/ff7-flac-test.flac
+          flac -t /tmp/ff7-full-length.flac
+          flac -d -c --force-raw-format --endian=little --sign=signed /tmp/ff7-flac-test.flac > /tmp/ff7-roundtrip.raw
+          python3 - <<'PY'
+          import struct
+          raw = open("/tmp/ff7-roundtrip.raw", "rb").read()
+          expected = b"".join(struct.pack("<hh", (i % 1000) * 20 - 10000, -((i % 1000) * 20 - 10000)) for i in range(9000))
+          assert raw == expected, f"PCM mismatch: {len(raw)} vs {len(expected)}"
+          print("Verified bit-exact 9000-frame stereo FLAC round trip")
+          PY
+      - name: Fetch pinned PSF1 decoder sources
+        run: |
+          git clone https://github.com/mitsuman/psf2wav.git /tmp/psf2wav
+          git -C /tmp/psf2wav checkout e07e01a816ae74ba9c7eeaffcd6d9bf7fb294afc
+          mkdir -p FF7FLACConverter/Vendor
+          cp -R /tmp/psf2wav/sexypsf FF7FLACConverter/Vendor/
+          find FF7FLACConverter/Vendor/sexypsf -name '*.o' -delete
+          # These are included directly by spu.c, not independent translation units.
+          for name in reverb adsr registers dma; do
+            mv "FF7FLACConverter/Vendor/sexypsf/spu/$name.c" "FF7FLACConverter/Vendor/sexypsf/spu/$name.inc"
+            sed -i '' "s/$name\\.c/$name.inc/" FF7FLACConverter/Vendor/sexypsf/spu/spu.c
+          done
+          # Fix upstream 32-bit pointer truncation on arm64 (memory lookup table).
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("FF7FLACConverter/Vendor/sexypsf/PsxMem.c")
+          source = path.read_text()
+          for variable in ("psxP", "psxH", "psxR"):
+              old = "(u32)&" + variable
+              assert old in source
+              source = source.replace(old, "&" + variable)
+          path.write_text(source)
+          PY
+          # Compile exactly the original sexypsf engine source list.
+          find FF7FLACConverter/Vendor/sexypsf -name '*.c' | while read -r file; do
+            case "${file##*/}" in
+              PsxBios.c|PsxCounters.c|PsxDma.c|Spu.c|PsxHw.c|PsxMem.c|Misc.c|R3000A.c|PsxInterpreter.c|PsxHLE.c|spu.c) ;;
+              *) rm "$file" ;;
+            esac
+          done
+      - name: Smoke-test PSF1 engine with generated legal fixture
+        run: |
+          python3 - <<'PY'
+          import struct, zlib
+          exe = bytearray(0x808)
+          exe[:8] = b"PS-X EXE"
+          struct.pack_into("<I", exe, 16, 0x80010000) # entry point
+          struct.pack_into("<I", exe, 24, 0x80010000) # code address
+          struct.pack_into("<I", exe, 28, 8)          # code size
+          struct.pack_into("<II", exe, 0x800, 0x08004000, 0) # jump to self; nop
+          compressed = zlib.compress(exe)
+          data = b"PSF\x01" + struct.pack("<III", 0, len(compressed), zlib.crc32(compressed))
+          data += compressed + b"[TAG]\nlength=1\nfade=0\ntitle=CI Fixture\n"
+          open("/tmp/ff7-test.psf", "wb").write(data)
+          PY
+          cat > /tmp/test-decoder.c <<'C'
+          #include "PSFDecoderBridge.h"
+          #include <stdio.h>
+          static long bytes_received = 0;
+          static FILE *pcm_file;
+          static void receive(const unsigned char *data, long count, void *context) {
+              bytes_received += count;
+              if (pcm_file) fwrite(data, 1, count, pcm_file);
+          }
+          int main(void) {
+              pcm_file = fopen("/tmp/ff7-decoded.raw", "wb");
+              if (!pcm_file) return 2;
+              int result = ff7_decode_psf("/tmp/ff7-test.psf", receive, NULL);
+              fclose(pcm_file);
+              printf("PSF1 decode result=%d PCM bytes=%ld\n", result, bytes_received);
+              return (result == 0 && bytes_received > 100000 && bytes_received < 200000) ? 0 : 1;
+          }
+          C
+          clang -O2 -fcommon -DEMU_COMPILE -DEMU_LITTLE_ENDIAN -I FF7FLACConverter \
+            FF7FLACConverter/PSFDecoderBridge.c \
+            FF7FLACConverter/Vendor/sexypsf/*.c \
+            FF7FLACConverter/Vendor/sexypsf/spu/spu.c \
+            /tmp/test-decoder.c -lz -o /tmp/ff7-test-decoder
+          python3 - <<'PY'
+          import subprocess
+          subprocess.run(["/tmp/ff7-test-decoder"], timeout=20, check=True)
+          PY
+          # Check real PSF1 decoder output survives lossless encoding.
+          brew install ffmpeg
+          ffmpeg -v error -f s16le -ar 44100 -ac 2 -i /tmp/ff7-decoded.raw -c:a flac -y /tmp/ff7-decoder-smoke.flac
+          flac -t /tmp/ff7-decoder-smoke.flac
+          ffmpeg -v error -i /tmp/ff7-decoder-smoke.flac -f s16le -acodec pcm_s16le -y /tmp/ff7-recovered.raw
+          cmp /tmp/ff7-decoded.raw /tmp/ff7-recovered.raw
+          echo "PSF1 decoder to FLAC bit-exact round trip passed"
+      - name: Generate project
+        run: xcodegen generate
+      - name: Build app
+        run: |
+          xcodebuild -project FF7FLACConverter.xcodeproj -scheme FF7FLACConverter -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/FF7FLACConverter.app Payload/
+          zip -qr FF7FLACConverter-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FF7FLACConverter-unsigned
+          path: FF7FLACConverter-unsigned.ipa
