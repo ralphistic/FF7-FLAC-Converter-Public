@@ -1,5 +1,33 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import UIKit
+
+struct PSFDocumentPicker: UIViewControllerRepresentable {
+    let onSelection: ([URL]) -> Void
+    let onCancel: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
+        picker.allowsMultipleSelection = true
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let parent: PSFDocumentPicker
+        init(_ parent: PSFDocumentPicker) { self.parent = parent }
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            parent.onSelection(urls)
+        }
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            parent.onCancel()
+        }
+    }
+}
 
 @main
 struct FF7FLACConverterApp: App {
@@ -80,12 +108,14 @@ struct ContentView: View {
             }
             .padding()
             .navigationTitle("Converter")
-            .fileImporter(isPresented: $showingImporter, allowedContentTypes: [.item],
-                          allowsMultipleSelection: true) { result in
-                switch result {
-                case .success(let urls): importFiles(urls)
-                case .failure(let error): status = "Import failed: \(error.localizedDescription)"
-                }
+            .sheet(isPresented: $showingImporter) {
+                PSFDocumentPicker(onSelection: { urls in
+                    showingImporter = false
+                    status = "Received \(urls.count) selected file(s). Importing..."
+                    importFiles(urls)
+                }, onCancel: {
+                    showingImporter = false
+                })
             }
             .sheet(isPresented: $showingExport) { ExportSheet(urls: outputs) }
         }
